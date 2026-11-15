@@ -1,0 +1,30 @@
+{
+  "score_thr": 0.32,
+  "min_area": 200,
+  "mask_thr": 0.5,
+  "min_keep_frac": 0.8,
+  "val_pq": 0.47765699680340634,
+  "val_sq": 0.6893809507288137,
+  "val_rq": 0.6928781485743511,
+  "TP": 5419,
+  "FP": 2024,
+  "FN": 2780,
+  "fold": -1,
+  "nested_cv": {
+    "baseline": "thr0.34/area200/keep0",
+    "delta": 0.0029,
+    "folds": [
+      0.0043,
+      0.0017,
+      0.0035,
+      0.0037,
+      0.0012
+    ],
+    "ci95": [
+      0.001,
+      0.0049
+    ],
+    "picks": "(0.32,200,0.8) in all 5 outer folds"
+  },
+  "note": "retain-fraction rule: after descending-score disjoint painting, drop an instance if fewer than 80% of its own pixels remain (fragment of an already-kept filament). Grid thr 0.32-0.36 x area 150/200/250 x keep 0-0.8, nested CV (2026-11-16)."
+}

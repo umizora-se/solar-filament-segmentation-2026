@@ -1,0 +1,14 @@
+# マスクヘッド高解像度化版（stride4 -> stride2）
+#   実測: stride4 では GT完璧予測でも IoU中央値0.81が上限。stride2 で0.91に。
+#   out[-1] を 2倍 upsample + 3x3 conv で精細化してから mask_features に通す。
+#   マスクが4倍になりメモリを食うため、クロップ768 + bs1×累積8 で収める（実測5.4GB）。
+_BASE_: maskdino_filament_r50_1024crop.yaml
+INPUT:
+  IMAGE_SIZE: 768
+SOLVER:
+  IMS_PER_BATCH: 1
+  ACCUM_STEPS: 8          # 実効バッチ8を維持
+FILAMENT:
+  HIRES_MASK: True
+  CUDA_MEM_FRACTION: 0.90
+OUTPUT_DIR: "./work_dirs/r50_hires"

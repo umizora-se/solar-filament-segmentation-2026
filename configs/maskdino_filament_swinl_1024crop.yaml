@@ -1,0 +1,62 @@
+# Swin-L バックボーン版。R50 版との違いは「検出器そのものを強くする」点だけで、
+# 学習レシピ（実効バッチ8・エポック数・拡張・後処理）は R50 版と揃える。
+#   R50    COCO mask AP 46.1
+#   Swin-L COCO mask AP 52.3
+# 狙いは完全FP 1,435件（OOF 707枚で +0.042 の伸びしろ）の削減。マスク品質(SQ 0.684)は
+# 文献と同水準で頭打ちだが、黒点や雲との識別は表現力に依存するため。
+_BASE_: ../external/MaskDINO/configs/coco/instance-segmentation/swin/maskdino_R50_bs16_50ep_4s_dowsample1_2048.yaml
+MODEL:
+  SWIN:
+    USE_CHECKPOINT: True        # Swin 自身の勾配チェックポイント。Swin-L は stage3 だけで18ブロック
+  WEIGHTS: "swin_large_patch4_window12_384_22k.pkl"  # train_filament.py が COCO 事前学習に差し替え
+  PIXEL_MEAN: [130.0, 130.0, 130.0]     # Hα グレースケールの実測値（R50 版と同じ）
+  PIXEL_STD: [55.0, 55.0, 55.0]
+  SEM_SEG_HEAD:
+    NUM_CLASSES: 1
+  MaskDINO:
+    NUM_OBJECT_QUERIES: 300
+    TEST:
+      SEMANTIC_ON: False
+      INSTANCE_ON: True
+      PANOPTIC_ON: False
+      OBJECT_MASK_THRESHOLD: 0.20
+DATASETS:
+  TRAIN: ("filament_train_f0",)
+  TEST: ("filament_val_f0",)
+INPUT:
+  FORMAT: "RGB"
+  DATASET_MAPPER_NAME: "filament_instance"
+  IMAGE_SIZE: 1024
+  MIN_SCALE: 0.7
+  MAX_SCALE: 1.3
+  RANDOM_FLIP: "none"
+SOLVER:
+  IMS_PER_BATCH: 1             # Swin-L + 4scale は重い。実効バッチは累積で 8 に揃える
+  ACCUM_STEPS: 8
+  BASE_LR: 0.0001
+  WARMUP_ITERS: 500
+  WARMUP_FACTOR: 0.01
+  STEPS: (4000,)
+  MAX_ITER: 5000               # R50 版とエポック数を一致させる
+  CHECKPOINT_PERIOD: 1000
+  WEIGHT_DECAY: 0.05
+  OPTIMIZER: "ADAMW"
+  BACKBONE_MULTIPLIER: 0.1     # 背骨の学習率は 1/10（小データでの過学習対策）
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_TYPE: "full_model"
+    CLIP_VALUE: 0.01
+    NORM_TYPE: 2.0
+  AMP:
+    ENABLED: True
+TEST:
+  EVAL_PERIOD: 0               # 学習中の評価はOOMを起こす（学習+評価が上限を超える）
+FILAMENT:
+  CUDA_MEM_FRACTION: 0.85      # WSL2 のフリーズ対策（必須）
+  GRAD_CHECKPOINT: True
+  PRETRAINED_KEY: "swinl_4s"
+  SCORE_THR: 0.30
+  MIN_AREA: 200
+  MASK_THR: 0.5
+  EVAL_MAX_IMAGES: 50
+  EVAL_AFTER_TRAIN: False      # 同上。本評価は学習後に別プロセスで行う

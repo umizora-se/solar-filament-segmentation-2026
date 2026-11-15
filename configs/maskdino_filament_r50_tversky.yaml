@@ -1,0 +1,7 @@
+# Focal-Tversky 損失版（FN=見逃しを重く罰する）
+#   誤差分解で FN 630 > FP 556。細く淡いフィラメントを拾いにいく。
+#   マスク損失のみ Dice → Focal-Tversky(α=0.7, β=0.3, γ=0.75)。他は fold0 と同一。
+_BASE_: maskdino_filament_r50_1024crop.yaml
+FILAMENT:
+  TVERSKY_LOSS: True
+OUTPUT_DIR: "./work_dirs/r50_tversky"

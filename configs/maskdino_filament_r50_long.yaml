@@ -1,0 +1,23 @@
+# 長時間学習版（CUDA カーネル導入後）
+#   前回: 5000 iter で val-PQ 0.3012、最後の1000iterで最大の伸び = 未飽和
+#   実測: CUDA カーネルで 0.85 -> 0.48 s/micro-step（1.8倍高速）
+_BASE_: maskdino_filament_r50_1024crop.yaml
+
+SOLVER:
+  IMS_PER_BATCH: 2             # 実測 1024crop bs2 = 6.83 GiB (43%)、最良スループット
+  ACCUM_STEPS: 4               # 実効バッチ 8
+  BASE_LR: 0.0001
+  WARMUP_ITERS: 500
+  STEPS: (14000, 18000)        # 2段減衰（前回は1段のみ）
+  MAX_ITER: 20000              # 20000*8/928 ≒ 172 epoch
+                               # 実測 0.48s x 4 = 1.92 s/実効iter -> 約10.7時間
+  CHECKPOINT_PERIOD: 2000
+
+TEST:
+  EVAL_PERIOD: 2000            # 10回評価。val-PQ 最良を model_best.pth に自動保存
+
+FILAMENT:
+  EVAL_MAX_IMAGES: 50          # 評価1回あたり約2分（CUDA カーネルで高速化済み）
+  DUMP_PRED: True
+
+OUTPUT_DIR: "./work_dirs/r50_f0_long"

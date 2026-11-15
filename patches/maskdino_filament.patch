@@ -1,0 +1,625 @@
+diff --git a/maskdino/maskdino.py b/maskdino/maskdino.py
+index ea93ed7..fc1d55a 100644
+--- a/maskdino/maskdino.py
++++ b/maskdino/maskdino.py
+@@ -346,7 +346,9 @@ class MaskDINO(nn.Module):
+                 {
+                     "labels": targets_per_image.gt_classes,
+                     "masks": padded_masks,
+-                    "boxes":box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy
++                    "boxes":box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy,
++                    # PATCHED (filament IoU-aware cls): 正規化座標(実画像) -> パディング込み正規化座標の倍率
++                    "pad_scale": torch.as_tensor([w / w_pad, h / h_pad], dtype=torch.float, device=self.device),
+                 }
+             )
+         return new_targets
+@@ -366,7 +368,9 @@ class MaskDINO(nn.Module):
+                 {
+                     "labels": targets_per_image.gt_classes,
+                     "masks": padded_masks,
+-                    "boxes": box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor) / image_size_xyxy
++                    "boxes": box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor) / image_size_xyxy,
++                    # PATCHED (filament IoU-aware cls): 正規化座標(実画像) -> パディング込み正規化座標の倍率
++                    "pad_scale": torch.as_tensor([w / w_pad, h / h_pad], dtype=torch.float, device=self.device),
+                 }
+             )
+         return new_targets
+@@ -470,8 +474,11 @@ class MaskDINO(nn.Module):
+             labels_per_image = labels_per_image[keep]
+             mask_pred = mask_pred[keep]
+         result = Instances(image_size)
+-        # mask (before sigmoid)
+-        result.pred_masks = (mask_pred > 0).float()
++        # PATCHED (filament baseline): マスクを2値でなく確率（シグモイド）のまま返す。
++        # 外側で TTA 票決前の2値化閾値 (mask_bin_thr) を選べるようにするため。
++        # 下のスコア計算は従来どおり2値マスク基準を維持する（スコア互換性のため）。
++        _bin_masks = (mask_pred > 0).float()
++        result.pred_masks = mask_pred.sigmoid()
+         # half mask box half pred box
+         mask_box_result = mask_box_result[topk_indices]
+         if self.panoptic_on:
+@@ -481,7 +488,7 @@ class MaskDINO(nn.Module):
+         # result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
+ 
+         # calculate average mask prob
+-        mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
++        mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * _bin_masks.flatten(1)).sum(1) / (_bin_masks.flatten(1).sum(1) + 1e-6)
+         if self.focus_on_box:
+             mask_scores_per_image = 1.0
+         result.scores = scores_per_image * mask_scores_per_image
+diff --git a/maskdino/modeling/criterion.py b/maskdino/modeling/criterion.py
+index 2d39083..2aa9d7d 100644
+--- a/maskdino/modeling/criterion.py
++++ b/maskdino/modeling/criterion.py
+@@ -11,6 +11,8 @@ MaskFormer criterion.
+ import logging
+ 
+ import torch
++from . import point_mask as _pm  # PATCHED (filament baseline)
++import os as _os
+ import torch.nn.functional as F
+ from torch import nn
+ 
+@@ -80,6 +82,37 @@ dice_loss_jit = torch.jit.script(
+ )  # type: torch.jit.ScriptModule
+ 
+ 
++def focal_tversky_loss(
++        inputs: torch.Tensor,
++        targets: torch.Tensor,
++        num_masks: float,
++        alpha: float = 0.7,
++        beta: float = 0.3,
++        gamma: float = 1.0,
++    ):
++    """PATCHED (filament baseline): Tversky 損失（FN偏重）。
++
++    Tversky = TP / (TP + alpha*FN + beta*FP)。alpha>beta で FN（見逃し）を重く罰する。
++    本データは FN(630) > FP(556) で見逃しが多く、細く淡いフィラメントを拾いにいくため
++    alpha=0.7, beta=0.3。Dice と同じ点サンプリング済みの平坦ベクトル上で計算する。
++
++    注: gamma<1 の focal 項は loss=0 付近で勾配が発散し AMP で NaN を生むため、
++    既定は gamma=1.0（通常の Tversky）。focal 効果が欲しければ gamma>=1 を使う。
++    """
++    inputs = inputs.sigmoid().flatten(1)
++    targets = targets.flatten(1)
++    tp = (inputs * targets).sum(-1)
++    fn = (targets * (1 - inputs)).sum(-1)
++    fp = ((1 - targets) * inputs).sum(-1)
++    tversky = (tp + 1) / (tp + alpha * fn + beta * fp + 1)
++    base = (1 - tversky).clamp(min=1e-6)      # 0近傍を避けて勾配発散を防ぐ
++    loss = base if gamma == 1.0 else base ** gamma
++    return loss.sum() / num_masks
++
++
++focal_tversky_loss_jit = torch.jit.script(focal_tversky_loss)
++
++
+ def sigmoid_ce_loss(
+         inputs: torch.Tensor,
+         targets: torch.Tensor,
+@@ -196,11 +229,63 @@ class SetCriterion(nn.Module):
+         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+ 
+         target_classes_onehot = target_classes_onehot[:,:,:-1]
++        # PATCHED (filament IoU-aware cls): 一致した予測のターゲットを 1 ではなくマスク IoU にする。
++        # PQ を最大にするスコアは「一致確率 × 一致時の IoU」なので、スコアが IoU を反映するよう学習させる
++        # （Stable-DINO の position-supervised loss / Align-DETR の IA-BCE と同じ考え方）。DN クエリは対象外。
++        if _os.environ.get("FILAMENT_IOU_CLS") == "1" and not getattr(self, "_in_dn", False) and len(target_classes_o):
++            ious = self._matched_mask_iou(outputs, targets, indices)
++            if ious is not None:
++                target_classes_onehot[idx[0], idx[1], target_classes_o] = ious.to(target_classes_onehot.dtype)
+         loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
+         losses = {'loss_ce': loss_ce}
+ 
+         return losses
+ 
++    @torch.no_grad()
++    def _matched_mask_iou(self, outputs, targets, indices, n_pts: int = 1024):
++        """PATCHED (filament IoU-aware cls): 一致した (予測, GT) ごとのマスク IoU を点サンプリングで推定する。
++
++        予測の箱と GT の箱を合わせた矩形に一様に点を打つ。両マスクをほぼ含む領域で一様に打てば
++        |交差| / |和| の比は面積に依らず偏りなく推定できる（全面に打つと細いフィラメントに点が当たらない）。
++        予測マスクは logit > 0（= sigmoid > 0.5、推論の 2 値化と同じ）。返り値の並びは
++        _get_src_permutation_idx と同じ（バッチ順に連結）。
++        """
++        pm = outputs.get("pred_masks")
++        pboxes = outputs.get("pred_boxes")
++        if pm is None or pboxes is None:
++            return None
++        out = []
++        for b, (src, tgt) in enumerate(indices):
++            if len(src) == 0:
++                continue
++            t = targets[b]
++            sc = t.get("pad_scale")
++            if sc is None:
++                return None
++            pb = box_ops.box_cxcywh_to_xyxy(pboxes[b, src].float())
++            gb = box_ops.box_cxcywh_to_xyxy(t["boxes"][tgt].float())
++            lo = torch.minimum(pb[:, :2], gb[:, :2]).clamp(0, 1)
++            hi = torch.maximum(pb[:, 2:], gb[:, 2:]).clamp(0, 1)
++            hi = torch.maximum(hi, lo + 1e-3)
++            n = len(src)
++            u = torch.rand(n, n_pts, 2, device=pb.device)
++            pts = (lo[:, None] + u * (hi - lo)[:, None]) * sc.view(1, 1, 2)      # (n, P, 2) パディング込み正規化
++            if pm.dim() == 3:                                                     # 点計算モード: 埋め込み (B,Q,C)
++                feats = point_sample(_pm.mask_features()[b:b + 1].float(), pts.reshape(1, -1, 2),
++                                     align_corners=False)[0]                      # (C, n*P)
++                feats = feats.view(feats.shape[0], n, n_pts)
++                logit = torch.einsum("nc,cnp->np", pm[b, src].float(), feats)
++            else:                                                                 # 全面マスク (B,Q,h,w)
++                logit = point_sample(pm[b, src][:, None].float(), pts, align_corners=False).squeeze(1)
++            gt = point_sample(t["masks"][tgt][:, None].float(), pts, align_corners=False).squeeze(1) > 0.5
++            pr = logit > 0
++            inter = (pr & gt).sum(1).float()
++            union = (pr | gt).sum(1).float()
++            out.append(torch.where(union > 0, inter / union.clamp(min=1), torch.zeros_like(union)))
++        if not out:
++            return None
++        return torch.cat(out).clamp(0, 1)
++
+     def loss_boxes(self, outputs, targets, indices, num_boxes):
+         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+@@ -247,6 +332,58 @@ class SetCriterion(nn.Module):
+ 
+         return losses
+ 
++    def _loss_masks_points(self, embeds, targets, src_idx, tgt_idx, num_masks):
++        """PATCHED (filament baseline): loss_masks を全面マスクなしで計算する。
++
++        元の手順（PointRend 式）: 各マスクについて一様乱数の候補点を oversample 倍取り、
++        不確実性（|logit| が小さい）上位 importance_sample_ratio を選び、残りを一様乱数で補う。
++        ここでは候補点を「画像ごとに全マスク共通」で取る（元はマスクごと）。各マスクから見れば
++        候補は一様乱数のままなので損失の期待値は変わらない。共通にすることで、候補点での
++        マスク特徴の抜き出し（C×S）を画像ごとに1回で済ませ、logit は内積で求める。
++        選んだ点での logit は point_sample(全面マスク, 点) と厳密に一致する。
++        """
++        emb = embeds[src_idx]                                   # (N, C)
++        masks = [t["masks"] for t in targets]
++        target_masks, valid = nested_tensor_from_tensor_list(masks).decompose()
++        target_masks = target_masks.to(emb)[tgt_idx]            # (N, H, W)
++        if emb.shape[0] == 0:
++            z = emb.sum() * 0.0
++            return {"loss_mask": z, "loss_dice": z}
++        P = self.num_points
++        S = int(P * self.oversample_ratio)
++        k_unc = int(self.importance_sample_ratio * P)
++        k_rand = P - k_unc
++        dev = emb.device
++        logits_all, labels_all = [], []
++        bidx = src_idx[0]
++        for b in torch.unique(bidx).tolist():
++            sel = (bidx == b).nonzero(as_tuple=True)[0]
++            e = emb[sel]                                        # (nb, C)
++            cand = torch.rand(S, 2, device=dev)
++            lc = _pm.logits_at(e, b, cand)                      # (nb, S)  勾配あり
++            with torch.no_grad():
++                unc = calculate_uncertainty(lc.detach()[:, None])[:, 0]
++                idx = torch.topk(unc, k=k_unc, dim=1)[1]        # (nb, k_unc)
++            logits = torch.gather(lc, 1, idx)
++            coords = cand[idx]                                  # (nb, k_unc, 2)
++            if k_rand > 0:
++                r = torch.rand(k_rand, 2, device=dev)
++                logits = torch.cat([logits, _pm.logits_at(e, b, r)], dim=1)
++                coords = torch.cat([coords, r[None].expand(e.shape[0], -1, -1)], dim=1)
++            with torch.no_grad():
++                labels = point_sample(target_masks[sel][:, None], coords,
++                                      align_corners=False).squeeze(1)
++            logits_all.append(logits)
++            labels_all.append(labels)
++        point_logits = torch.cat(logits_all, 0)
++        point_labels = torch.cat(labels_all, 0)
++        return {
++            "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
++            "loss_dice": (focal_tversky_loss_jit(point_logits, point_labels, num_masks)
++                          if _os.environ.get("FILAMENT_TVERSKY") == "1"
++                          else dice_loss_jit(point_logits, point_labels, num_masks)),
++        }
++
+     def loss_masks(self, outputs, targets, indices, num_masks):
+         """Compute the losses related to the masks: the focal loss and the dice loss.
+         targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
+@@ -256,6 +393,8 @@ class SetCriterion(nn.Module):
+         src_idx = self._get_src_permutation_idx(indices)
+         tgt_idx = self._get_tgt_permutation_idx(indices)
+         src_masks = outputs["pred_masks"]
++        if src_masks.dim() == 3:                 # PATCHED: 学習時の埋め込み (B,Q,C)
++            return self._loss_masks_points(src_masks, targets, src_idx, tgt_idx, num_masks)
+         src_masks = src_masks[src_idx]
+         masks = [t["masks"] for t in targets]
+         # TODO use valid to mask invalid areas due to padding in loss
+@@ -292,7 +431,9 @@ class SetCriterion(nn.Module):
+ 
+         losses = {
+             "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
+-            "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
++            "loss_dice": (focal_tversky_loss_jit(point_logits, point_labels, num_masks)
++                          if _os.environ.get("FILAMENT_TVERSKY") == "1"
++                          else dice_loss_jit(point_logits, point_labels, num_masks)),
+         }
+ 
+         del src_masks
+@@ -371,8 +512,10 @@ class SetCriterion(nn.Module):
+ 
+         if self.dn != "no" and mask_dict is not None:
+             l_dict={}
++            self._in_dn = True   # PATCHED: DN クエリは IoU 考慮型ターゲットの対象外
+             for loss in self.dn_losses:
+                 l_dict.update(self.get_loss(loss, output_known_lbs_bboxes, targets, exc_idx, num_masks*scalar))
++            self._in_dn = False
+             l_dict = {k + f'_dn': v for k, v in l_dict.items()}
+             losses.update(l_dict)
+         elif self.dn != "no":
+@@ -401,9 +544,11 @@ class SetCriterion(nn.Module):
+                     if self.dn != "no" and mask_dict is not None:
+                         out_=output_known_lbs_bboxes['aux_outputs'][i]
+                         l_dict = {}
++                        self._in_dn = True
+                         for loss in self.dn_losses:
+                             l_dict.update(
+                                 self.get_loss(loss, out_, targets, exc_idx, num_masks * scalar))
++                        self._in_dn = False
+                         l_dict = {k + f'_dn_{i}': v for k, v in l_dict.items()}
+                         losses.update(l_dict)
+                     elif self.dn != "no":
+diff --git a/maskdino/modeling/matcher.py b/maskdino/modeling/matcher.py
+index 20d42bb..ae4c72d 100644
+--- a/maskdino/modeling/matcher.py
++++ b/maskdino/modeling/matcher.py
+@@ -15,6 +15,7 @@ from torch import nn
+ from torch.cuda.amp import autocast
+ 
+ from detectron2.projects.point_rend.point_features import point_sample
++from . import point_mask as _pm  # PATCHED (filament baseline)
+ from maskdino.utils.box_ops import generalized_box_iou,box_cxcywh_to_xyxy
+ 
+ 
+@@ -135,11 +136,13 @@ class HungarianMatcher(nn.Module):
+             # The 1 is a constant that doesn't change the matching, it can be ommitted.
+             # cost_class = -out_prob[:, tgt_ids]
+             if 'mask' in cost:
+-                out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred]
++                out_mask = outputs["pred_masks"][b]  # [num_queries, H_pred, W_pred] / 学習時の埋め込みなら [num_queries, C]
++                _embed = out_mask.dim() == 2           # PATCHED (filament baseline)
+                 # gt masks are already padded when preparing target
+                 tgt_mask = targets[b]["masks"].to(out_mask)
+ 
+-                out_mask = out_mask[:, None]
++                if not _embed:
++                    out_mask = out_mask[:, None]
+                 tgt_mask = tgt_mask[:, None]
+                 # all masks share the same set of points for efficient matching!
+                 point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
+@@ -150,11 +153,15 @@ class HungarianMatcher(nn.Module):
+                     align_corners=False,
+                 ).squeeze(1)
+ 
+-                out_mask = point_sample(
+-                    out_mask,
+-                    point_coords.repeat(out_mask.shape[0], 1, 1),
+-                    align_corners=False,
+-                ).squeeze(1)
++                if _embed:
++                    # 全面マスクを作らず、同じ点でのマスク logit だけを計算する（厳密に同値）
++                    out_mask = _pm.logits_at(out_mask, b, point_coords[0])
++                else:
++                    out_mask = point_sample(
++                        out_mask,
++                        point_coords.repeat(out_mask.shape[0], 1, 1),
++                        align_corners=False,
++                    ).squeeze(1)
+ 
+                 with autocast(enabled=False):
+                     out_mask = out_mask.float()
+diff --git a/maskdino/modeling/pixel_decoder/maskdino_encoder.py b/maskdino/modeling/pixel_decoder/maskdino_encoder.py
+index 3cbf201..963edea 100644
+--- a/maskdino/modeling/pixel_decoder/maskdino_encoder.py
++++ b/maskdino/modeling/pixel_decoder/maskdino_encoder.py
+@@ -181,8 +181,19 @@ class MSDeformAttnTransformerEncoder(nn.Module):
+     def forward(self, src, spatial_shapes, level_start_index, valid_ratios, pos=None, padding_mask=None):
+         output = src
+         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
++        # PATCHED (filament baseline): 勾配チェックポイント。
++        # deformable attention エンコーダは活性化メモリの支配項（1024^2 入力で 21,504 トークン）。
++        # FILAMENT_GRAD_CKPT=1 で各層の活性化を保存せず backward 時に再計算する
++        # （計算 +約30% と引き換えにピークメモリを大幅削減）。
++        import os
++        use_ckpt = os.environ.get("FILAMENT_GRAD_CKPT", "0") == "1" and self.training
+         for _, layer in enumerate(self.layers):
+-            output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask)
++            if use_ckpt:
++                from torch.utils.checkpoint import checkpoint
++                output = checkpoint(layer, output, pos, reference_points, spatial_shapes,
++                                    level_start_index, padding_mask, use_reentrant=False)
++            else:
++                output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask)
+ 
+         return output
+ 
+@@ -300,6 +311,38 @@ class MaskDINOEncoder(nn.Module):
+             padding=0,
+         )
+         weight_init.c2_xavier_fill(self.mask_features)
++
++        # PATCHED (filament baseline): マスク解像度の高解像度化。
++        # ResNet-50 の最細特徴は res2(stride4)。マスクが stride4(512^2) だと
++        # GT を完璧に予測しても IoU 中央値 0.81 が上限（実測）。stride2 にすると
++        # 上限が 0.91 に上がる。out[-1] を 2倍 upsample + 3x3 conv で精細化してから
++        # mask_features に通す。FILAMENT_HIRES_MASK=1 で有効。
++        import os as _os
++        self._hires_mask = _os.environ.get("FILAMENT_HIRES_MASK") == "1"
++        if self._hires_mask:
++            self.hires_up = Conv2d(conv_dim, conv_dim, kernel_size=3, stride=1,
++                                   padding=1, bias=(norm == ""),
++                                   norm=get_norm(norm, conv_dim), activation=F.relu)
++            weight_init.c2_xavier_fill(self.hires_up)
++        # PATCHED (filament baseline): stride2 の実画像特徴を足し込む skip 接続。
++        # 上の hires_up は stride4 の特徴を補間で引き伸ばすだけで、細い構造（barb）の
++        # 情報は増えない。ResNet の stem は conv1(stride2)→relu→max_pool で、
++        # stride2 の特徴を max_pool の直前で捨てている。それを取り出して足す（U-Net の skip と同じ）。
++        # FILAMENT_HIRES_SKIP=1 で有効（FILAMENT_HIRES_MASK=1 が前提）。
++        self._hires_skip = self._hires_mask and _os.environ.get("FILAMENT_HIRES_SKIP") == "1"
++        if self._hires_skip:
++            # 1024^2 で 256ch の 3x3 畳み込みを重ねると原寸2048ではメモリに収まらない（実測 OOM、
++            # クエリ50でも不可）。高解像度側の処理は 64ch の軽い経路に限定し、最後に 1x1 で
++            # mask_dim に上げてマスク特徴（stride4 を拡大したもの）に足し込む。
++            self.hires_skip_conv = Conv2d(64, 64, kernel_size=3, stride=1, padding=1,
++                                          bias=(norm == ""), norm=get_norm(norm, 64),
++                                          activation=F.relu)
++            self.hires_lat = Conv2d(64, mask_dim, kernel_size=1)
++            weight_init.c2_xavier_fill(self.hires_skip_conv)
++            # 学習開始時は skip の寄与をゼロにし、事前学習済みのマスク特徴を壊さない
++            torch.nn.init.zeros_(self.hires_lat.weight)
++            torch.nn.init.zeros_(self.hires_lat.bias)
++            _install_stem_capture()
+         # extra fpn levels
+         stride = min(self.transformer_feature_strides)
+         self.num_fpn_levels = max(int(np.log2(stride) - np.log2(self.common_stride)), 1)
+@@ -425,5 +468,42 @@ class MaskDINOEncoder(nn.Module):
+             if num_cur_levels < self.total_num_feature_levels:
+                 multi_scale_features.append(o)
+                 num_cur_levels += 1
+-        return self.mask_features(out[-1]), out[0], multi_scale_features
+-
++        _mf_in = out[-1]
++        if getattr(self, "_hires_skip", False):
++            # マスク特徴は stride4 で作ってから2倍に拡大し、stem の stride2 実特徴を足す
++            mf = F.interpolate(self.mask_features(_mf_in), scale_factor=2, mode="bilinear",
++                               align_corners=False)
++            pre = _STEM_CACHE.pop("pre_pool", None)
++            if pre is None:
++                raise RuntimeError("stem の stride2 特徴が取得できていない（_install_stem_capture 未適用）")
++            lat = self.hires_lat(self.hires_skip_conv(pre.float()))
++            if lat.shape[-2:] != mf.shape[-2:]:
++                lat = F.interpolate(lat, size=mf.shape[-2:], mode="bilinear", align_corners=False)
++            return mf + lat, out[0], multi_scale_features
++        if getattr(self, "_hires_mask", False):
++            _mf_in = F.interpolate(_mf_in, scale_factor=2, mode="bilinear",
++                                   align_corners=False)
++            _mf_in = self.hires_up(_mf_in)
++        return self.mask_features(_mf_in), out[0], multi_scale_features
++
++
++
++
++# PATCHED (filament baseline): ResNet stem の stride2 特徴（max_pool 直前）を捕捉する。
++# detectron2 本体は書き換えず、FILAMENT_HIRES_SKIP=1 のときだけ実行時に forward を差し替える。
++_STEM_CACHE = {}
++
++
++def _install_stem_capture():
++    from detectron2.modeling.backbone import resnet as _r
++    if getattr(_r.BasicStem, "_filament_capture", False):
++        return
++
++    def _forward(self, x):
++        x = self.conv1(x)
++        x = F.relu_(x)
++        _STEM_CACHE["pre_pool"] = x               # (N, 64, H/2, W/2)
++        return F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
++
++    _r.BasicStem.forward = _forward
++    _r.BasicStem._filament_capture = True
+diff --git a/maskdino/modeling/pixel_decoder/ops/functions/ms_deform_attn_func.py b/maskdino/modeling/pixel_decoder/ops/functions/ms_deform_attn_func.py
+index c17aca4..abeddef 100644
+--- a/maskdino/modeling/pixel_decoder/ops/functions/ms_deform_attn_func.py
++++ b/maskdino/modeling/pixel_decoder/ops/functions/ms_deform_attn_func.py
+@@ -21,12 +21,13 @@ from torch.autograd.function import once_differentiable
+ try:
+     import MultiScaleDeformableAttention as MSDA
+ except ModuleNotFoundError as e:
+-    info_string = (
+-        "\n\nPlease compile MultiScaleDeformableAttention CUDA op with the following commands:\n"
+-        "\t`cd maskdino/modeling/pixel_decoder/ops`\n"
+-        "\t`sh make.sh`\n"
+-    )
+-    raise ModuleNotFoundError(info_string)
++    # PATCHED (filament baseline): the compiled CUDA op is unavailable in this
++    # environment (no CUDA toolkit / unsupported GPU arch). We fall back to the
++    # pure-PyTorch implementation `ms_deform_attn_core_pytorch`. The call site in
++    # modules/ms_deform_attn.py already wraps MSDeformAttnFunction.apply in a
++    # try/except that routes to the PyTorch core, so setting MSDA=None is enough.
++    # This is slower (~1.5-2x) but numerically equivalent and arch-independent.
++    MSDA = None
+ 
+ 
+ class MSDeformAttnFunction(Function):
+@@ -42,9 +43,12 @@ class MSDeformAttnFunction(Function):
+     @once_differentiable
+     def backward(ctx, grad_output):
+         value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights = ctx.saved_tensors
++        # PATCHED (filament baseline): CUDA カーネルは grad_output が contiguous であることを
++        # 要求する（is_contiguous() の INTERNAL ASSERT）。autograd から渡る勾配は
++        # 非 contiguous なことがあるので明示的に変換する。
+         grad_value, grad_sampling_loc, grad_attn_weight = \
+             MSDA.ms_deform_attn_backward(
+-                value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, grad_output, ctx.im2col_step)
++                value, value_spatial_shapes, value_level_start_index, sampling_locations, attention_weights, grad_output.contiguous(), ctx.im2col_step)
+ 
+         return grad_value, None, None, grad_sampling_loc, grad_attn_weight, None
+ 
+@@ -54,7 +58,7 @@ def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations,
+     # need to use cuda version instead
+     N_, S_, M_, D_ = value.shape
+     _, Lq_, M_, L_, P_, _ = sampling_locations.shape
+-    value_list = value.split([H_ * W_ for H_, W_ in value_spatial_shapes], dim=1)
++    value_list = value.split([int(H_) * int(W_) for H_, W_ in value_spatial_shapes], dim=1)
+     sampling_grids = 2 * sampling_locations - 1
+     sampling_value_list = []
+     for lid_, (H_, W_) in enumerate(value_spatial_shapes):
+@@ -66,7 +70,15 @@ def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations,
+         sampling_value_l_ = F.grid_sample(value_l_, sampling_grid_l_,
+                                           mode='bilinear', padding_mode='zeros', align_corners=False)
+         sampling_value_list.append(sampling_value_l_)
+-    # (N_, Lq_, M_, L_, P_) -> (N_, M_, Lq_, L_, P_) -> (N_, M_, 1, Lq_, L_*P_)
+-    attention_weights = attention_weights.transpose(1, 2).reshape(N_*M_, 1, Lq_, L_*P_)
+-    output = (torch.stack(sampling_value_list, dim=-2).flatten(-2) * attention_weights).sum(-1).view(N_, M_*D_, Lq_)
++    # PATCHED (filament baseline): メモリ効率版。
++    # 元実装は torch.stack(...).flatten(-2) で (N*M, D, Lq, L*P) を実体化するため
++    # 1024^2 入力では 1GB/層 を超える。レベルごとに逐次加算して L 倍のピークを避ける。
++    # (N_, Lq_, M_, L_, P_) -> (N_, M_, Lq_, L_, P_)
++    aw = attention_weights.transpose(1, 2)                       # N_, M_, Lq_, L_, P_
++    output = None
++    for lid_, sv in enumerate(sampling_value_list):              # sv: (N_*M_, D_, Lq_, P_)
++        w = aw[:, :, :, lid_, :].reshape(N_*M_, 1, Lq_, P_)      # N_*M_, 1, Lq_, P_
++        part = (sv * w).sum(-1)                                  # N_*M_, D_, Lq_
++        output = part if output is None else output + part
++    output = output.view(N_, M_*D_, Lq_)
+     return output.transpose(1, 2).contiguous()
+diff --git a/maskdino/modeling/pixel_decoder/ops/modules/ms_deform_attn.py b/maskdino/modeling/pixel_decoder/ops/modules/ms_deform_attn.py
+index e7b4c42..e07de00 100644
+--- a/maskdino/modeling/pixel_decoder/ops/modules/ms_deform_attn.py
++++ b/maskdino/modeling/pixel_decoder/ops/modules/ms_deform_attn.py
+@@ -113,12 +113,17 @@ class MSDeformAttn(nn.Module):
+         else:
+             raise ValueError(
+                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
+-        try:
+-            output = MSDeformAttnFunction.apply(
+-                value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
+-        except:
+-            # CPU
++        from ..functions.ms_deform_attn_func import MSDA as _MSDA
++        if _MSDA is None:
++            # PATCHED (filament baseline): compiled CUDA op unavailable -> pure-PyTorch path.
+             output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)
++        else:
++            try:
++                output = MSDeformAttnFunction.apply(
++                    value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
++            except:
++                # CPU
++                output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)
+         # # For FLOPs calculation only
+         # output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)
+         output = self.output_proj(output)
+diff --git a/maskdino/modeling/pixel_decoder/ops/src/cuda/ms_deform_attn_cuda.cu b/maskdino/modeling/pixel_decoder/ops/src/cuda/ms_deform_attn_cuda.cu
+index 0c465da..c970947 100644
+--- a/maskdino/modeling/pixel_decoder/ops/src/cuda/ms_deform_attn_cuda.cu
++++ b/maskdino/modeling/pixel_decoder/ops/src/cuda/ms_deform_attn_cuda.cu
+@@ -66,15 +66,15 @@ at::Tensor ms_deform_attn_cuda_forward(
+     for (int n = 0; n < batch/im2col_step_; ++n)
+     {
+         auto columns = output_n.select(0, n);
+-        AT_DISPATCH_FLOATING_TYPES(value.type(), "ms_deform_attn_forward_cuda", ([&] {
++        AT_DISPATCH_FLOATING_TYPES(value.scalar_type(), "ms_deform_attn_forward_cuda", ([&] {
+             ms_deformable_im2col_cuda(at::cuda::getCurrentCUDAStream(),
+-                value.data<scalar_t>() + n * im2col_step_ * per_value_size,
+-                spatial_shapes.data<int64_t>(),
+-                level_start_index.data<int64_t>(),
+-                sampling_loc.data<scalar_t>() + n * im2col_step_ * per_sample_loc_size,
+-                attn_weight.data<scalar_t>() + n * im2col_step_ * per_attn_weight_size,
++                value.data_ptr<scalar_t>() + n * im2col_step_ * per_value_size,
++                spatial_shapes.data_ptr<int64_t>(),
++                level_start_index.data_ptr<int64_t>(),
++                sampling_loc.data_ptr<scalar_t>() + n * im2col_step_ * per_sample_loc_size,
++                attn_weight.data_ptr<scalar_t>() + n * im2col_step_ * per_attn_weight_size,
+                 batch_n, spatial_size, num_heads, channels, num_levels, num_query, num_point,
+-                columns.data<scalar_t>());
++                columns.data_ptr<scalar_t>());
+ 
+         }));
+     }
+@@ -136,18 +136,18 @@ std::vector<at::Tensor> ms_deform_attn_cuda_backward(
+     for (int n = 0; n < batch/im2col_step_; ++n)
+     {
+         auto grad_output_g = grad_output_n.select(0, n);
+-        AT_DISPATCH_FLOATING_TYPES(value.type(), "ms_deform_attn_backward_cuda", ([&] {
++        AT_DISPATCH_FLOATING_TYPES(value.scalar_type(), "ms_deform_attn_backward_cuda", ([&] {
+             ms_deformable_col2im_cuda(at::cuda::getCurrentCUDAStream(),
+-                                    grad_output_g.data<scalar_t>(),
+-                                    value.data<scalar_t>() + n * im2col_step_ * per_value_size,
+-                                    spatial_shapes.data<int64_t>(),
+-                                    level_start_index.data<int64_t>(),
+-                                    sampling_loc.data<scalar_t>() + n * im2col_step_ * per_sample_loc_size,
+-                                    attn_weight.data<scalar_t>() + n * im2col_step_ * per_attn_weight_size,
++                                    grad_output_g.data_ptr<scalar_t>(),
++                                    value.data_ptr<scalar_t>() + n * im2col_step_ * per_value_size,
++                                    spatial_shapes.data_ptr<int64_t>(),
++                                    level_start_index.data_ptr<int64_t>(),
++                                    sampling_loc.data_ptr<scalar_t>() + n * im2col_step_ * per_sample_loc_size,
++                                    attn_weight.data_ptr<scalar_t>() + n * im2col_step_ * per_attn_weight_size,
+                                     batch_n, spatial_size, num_heads, channels, num_levels, num_query, num_point,
+-                                    grad_value.data<scalar_t>() +  n * im2col_step_ * per_value_size,
+-                                    grad_sampling_loc.data<scalar_t>() + n * im2col_step_ * per_sample_loc_size,
+-                                    grad_attn_weight.data<scalar_t>() + n * im2col_step_ * per_attn_weight_size);
++                                    grad_value.data_ptr<scalar_t>() +  n * im2col_step_ * per_value_size,
++                                    grad_sampling_loc.data_ptr<scalar_t>() + n * im2col_step_ * per_sample_loc_size,
++                                    grad_attn_weight.data_ptr<scalar_t>() + n * im2col_step_ * per_attn_weight_size);
+ 
+         }));
+     }
+diff --git a/maskdino/modeling/transformer_decoder/maskdino_decoder.py b/maskdino/modeling/transformer_decoder/maskdino_decoder.py
+index e8e4b9e..5822298 100644
+--- a/maskdino/modeling/transformer_decoder/maskdino_decoder.py
++++ b/maskdino/modeling/transformer_decoder/maskdino_decoder.py
+@@ -18,6 +18,7 @@ from detectron2.structures import BitMasks
+ from .dino_decoder import TransformerDecoder, DeformableTransformerDecoderLayer
+ from ...utils.utils import MLP, gen_encoder_output_proposals, inverse_sigmoid
+ from ...utils import box_ops
++from .. import point_mask as _pm  # PATCHED (filament baseline)
+ 
+ 
+ TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
+@@ -368,6 +369,8 @@ class MaskDINODecoder(nn.Module):
+         :param masks: mask in the original image
+         :param targets: used for denoising training
+         """
++        if _pm.enabled(self.training):
++            _pm.set_mask_features(mask_features)   # PATCHED: 損失側で点を抜き出すため
+         assert len(x) == self.num_feature_levels
+         device = x[0].device
+         size_list = []
+@@ -424,8 +427,14 @@ class MaskDINODecoder(nn.Module):
+             if self.initialize_box_type != 'no':
+                 # convert masks into boxes to better initialize box in the decoder
+                 assert self.initial_pred
+-                flaten_mask = outputs_mask.detach().flatten(0, 1)
+-                h, w = outputs_mask.shape[-2:]
++                _full = outputs_mask
++                if _pm.enabled(self.training):
++                    # PATCHED: 初期の箱はマスク全面から作るので、この用途だけ全面を作る（勾配不要）
++                    with torch.no_grad():
++                        _full = torch.einsum("bqc,bchw->bqhw", outputs_mask.detach(),
++                                             mask_features.detach())
++                flaten_mask = _full.detach().flatten(0, 1)
++                h, w = _full.shape[-2:]
+                 if self.initialize_box_type == 'bitmask':  # slower, but more accurate
+                     refpoint_embed = BitMasks(flaten_mask > 0).get_bounding_boxes().tensor.to(device)
+                 elif self.initialize_box_type == 'mask2box':  # faster conversion
+@@ -507,7 +516,12 @@ class MaskDINODecoder(nn.Module):
+         outputs_mask = None
+         if pred_mask:
+             mask_embed = self.mask_embed(decoder_output)
+-            outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
++            if _pm.enabled(self.training):
++                # PATCHED (filament baseline): 学習時は全面マスクを作らず埋め込み (B,Q,C) を渡す。
++                # マッチングと損失は point_mask.logits_at で必要な点だけ計算する（結果は同一）。
++                outputs_mask = mask_embed
++            else:
++                outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
+ 
+         return outputs_class, outputs_mask
+ 

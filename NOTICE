@@ -1,0 +1,27 @@
+Solar Filament Segmentation Challenge 2026 - Native-Resolution Mask DINO solution
+Copyright 2026 yoiisohira
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Scope
+-----
+- The Apache License 2.0 covers the code in this repository (src/, scripts/,
+  notebooks/, configs/, patches/) and its documentation.
+
+- patches/ contains changes to Mask DINO
+  (https://github.com/IDEA-Research/MaskDINO, Copyright 2022 - present, IDEA,
+  Apache License 2.0). The patch file shows every change to the original files;
+  patches/point_mask.py is a new file added to Mask DINO.
+
+- release/weights/ (trained model weights) and the prediction files
+  release/oof_swa2_a0.75.json and release/submission_final.csv are not covered
+  by the Apache License. The weights were initialised from the Mask DINO COCO
+  checkpoint and trained on the MAGFiLO data provided for the Solar Filament
+  Segmentation Challenge 2026; the prediction files contain masks predicted on
+  MAGFiLO training and test images. They are provided to reproduce and verify
+  the competition results; any other use is subject to the terms of the MAGFiLO
+  dataset and of the competition.
+
+- Detectron2 (https://github.com/facebookresearch/detectron2) and Mask DINO are
+  not included in this repository and keep their own licenses (Apache License
+  2.0).

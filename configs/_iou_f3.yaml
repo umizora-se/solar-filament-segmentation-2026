@@ -1,0 +1,92 @@
+# MaskDINO フィラメント・ベースライン (R50, 1024 ネイティブクロップ)
+# _BASE_ は MaskDINO の 3-scale instance config。COCO 事前学習 checkpoint
+#   maskdino_r50_50ep_300q_hid1024_3sd1_instance (mask 46.1AP) と構造が一致する。
+# （4-scale はマスク解像度に有利だが 3sd1 checkpoint と projection 形状がズレるので baseline は 3s）
+_BASE_: ../external/MaskDINO/configs/coco/instance-segmentation/maskdino_R50_bs16_50ep_3s.yaml
+
+MODEL:
+  WEIGHTS: "detectron2://ImageNetPretrained/torchvision/R-50.pkl"  # train_filament.py が COCO 事前学習に差し替え
+  # GONG jpeg 実測（3ch 同値, src/compute_pixel_stats.py で算出可）
+  PIXEL_MEAN: [130.0, 130.0, 130.0]
+  PIXEL_STD: [55.0, 55.0, 55.0]
+  BACKBONE:
+    FREEZE_AT: 2                # stem + stage1 を凍結（小データ過学習対策）
+  SEM_SEG_HEAD:
+    NUM_CLASSES: 1
+  MaskDINO:
+    NUM_OBJECT_QUERIES: 150      # 実測の個体数は最大26/画像（平均7）。300は過剰。
+                                 # マスクヘッドが全クエリ分の高解像度マスク(512x512)を
+                                 # 9デコーダ層ぶん作るため、2048入力では最大の消費源になる。
+                                 # TWO_STAGE でクエリはエンコーダ提案から作られるので、
+                                 # 減らしても事前学習重みを一切失わない（依存テンソル0件を確認）
+    DN_NUM: 50                   # 既定100。denoising クエリも同様に半減   # COCO checkpoint と一致（max 26 本/画像なので余裕）
+    TEST:
+      SEMANTIC_ON: False
+      INSTANCE_ON: True
+      PANOPTIC_ON: False
+      OBJECT_MASK_THRESHOLD: 0.20   # 推論時の足切り（後処理チューニングで上書き）
+
+DATASETS:
+  TRAIN: ("filament_train_f3",)
+  TEST: ("filament_val_f3",)
+
+INPUT:
+  FORMAT: "RGB"
+  DATASET_MAPPER_NAME: "filament_instance"
+  IMAGE_SIZE: 2048            # ★クロップなし。全面を原寸で学習
+  MIN_SCALE: 0.9
+  MAX_SCALE: 1.1
+  RANDOM_FLIP: "none"
+  NATIVE_CROP: True            # 縮小しない。窓=2048=全面なので実質クロップもされない
+                               # 従来は ResizeScale(target=1024) が 2048 全体を約1024へ縮小していた
+                               # （実測: 個体の面積中央 960px -> 188-386px）
+
+SOLVER:
+  # === VRAM 16GB 実測に基づく設定 ===
+  #   1024crop bs2 + 勾配チェックポイント = 7.0 GiB (43%)  ← 採用
+  #   1024crop bs3 = 10.2 GiB (63%) / bs4 = OOM
+  #   個体数(7〜40)ではメモリはほぼ変わらない（エンコーダ支配のため）
+  IMS_PER_BATCH: 1             # フル2048は重い。実効バッチは累積で8に揃える
+  ACCUM_STEPS: 8               # 勾配累積 -> 実効バッチ 8
+  BASE_LR: 0.0001
+  WARMUP_ITERS: 500
+  WARMUP_FACTOR: 0.01
+  STEPS: (4000,)
+  MAX_ITER: 5000               # 実効iter。5000*8/928 ≒ 43 epoch
+                               # 実測 4.05 s/iter -> 学習 5.6時間 + 評価 5回x4分 ≒ 6.0時間
+  CHECKPOINT_PERIOD: 250       # 無言終了が起きたため保存頻度を上げる（損失を最大20分に抑える）
+  WEIGHT_DECAY: 0.05
+  OPTIMIZER: "ADAMW"
+  BACKBONE_MULTIPLIER: 0.1
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_TYPE: "full_model"
+    CLIP_VALUE: 0.01
+    NORM_TYPE: 2.0
+  AMP:
+    ENABLED: True
+
+TEST:
+  EVAL_PERIOD: 0               # 学習中の評価はOOMになる（学習9.7GB + フル2048推論が上限13.5GBを超える）
+  DETECTIONS_PER_IMAGE: 100
+
+DATALOADER:
+  FILTER_EMPTY_ANNOTATIONS: True
+  NUM_WORKERS: 1               # ホストRAMは19GB。2048^2のビットマスクを扱うため絞る
+
+OUTPUT_DIR: "./work_dirs/r50_f0"
+
+# 後処理（PQ 最適化は src/tune_postproc.py が上書き）
+FILAMENT:
+  IOU_CLS: True               # ★分類ターゲット = 一致した予測のマスク IoU（11/10 追加）
+  # --- VRAM 安全弁（WSL2 は GPU メモリ溢れをフリーズにするので必須）---
+  CUDA_MEM_FRACTION: 0.85      # 超えたら clean な CUDA OOM で落ちる
+  GRAD_CHECKPOINT: True        # エンコーダの活性化を再計算（12.4 -> 7.0 GiB）
+  # --- 評価コスト（フル2048推論は実測 4.5 s/枚、val 142枚で約11分）---
+  EVAL_AFTER_TRAIN: False      # 同上。本評価は学習後に別プロセスで行う
+  EVAL_MAX_IMAGES: 50          # 学習中の評価は50枚に間引く(約4分)。最終値は --eval-only で取り直す
+  # --- 後処理（PQ の限界解析より recall 寄りから探索する。設計書 §3.3）---
+  SCORE_THR: 0.20
+  MIN_AREA: 120          # 2048基準 px（面積 p01=209 を踏まえ小さめから）
+  MASK_THR: 0.5
+  DUMP_PRED: True        # val 推論の生予測(RLE+score)を work_dir に保存
