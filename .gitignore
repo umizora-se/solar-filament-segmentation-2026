@@ -4,3 +4,4 @@ work_dirs/
 datasets/
 external/
 release/run/
+release/weights/*.pth
