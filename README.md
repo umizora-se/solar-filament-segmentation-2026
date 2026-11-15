@@ -6,7 +6,7 @@ Technical report: `docs/technical_report.pdf`.
 ## Reproduce the predictions without retraining
 
 1. Environment (Python 3.10, CUDA 12.8, one GPU with 16 GB): `pip install -r requirements.txt`, then install
-   detectron2 0.6 and Mask DINO as described in `docs/REPRODUCE.md` (clone `IDEA-Research/MaskDINO` at commit `3831d85` into `external/MaskDINO`, apply `patches/maskdino_filament.patch`, copy `patches/point_mask.py`, build the CUDA ops).
+   detectron2 0.6 (commit `a2f4a87`) and Mask DINO as described in `docs/REPRODUCE.md` (clone `IDEA-Research/MaskDINO` at commit `3831d85` into `external/MaskDINO`, apply `patches/maskdino_filament.patch`, copy `patches/point_mask.py`, build the CUDA ops).
 2. Put the competition data where `src/filament_dataset.py` looks for it (`FILAMENT_ROOT`, or `datasets/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026`; `/kaggle/input/...` is detected automatically).
 3. Run `notebooks/pipeline_from_weights.ipynb`. It joins the weights in `release/weights/` (10 files in parts below 100 MB, SHA-256 in `MANIFEST.json`), runs the full inference pipeline, writes the CSV and compares it with `release/submission_final.csv`. The default runs 3 test images as a check; set `N_IMAGES = None` for the full run (about 10 h). The notebook's last cell recomputes the OOF PQ of the final setting from `release/oof_swa2_a0.75.json`.
 

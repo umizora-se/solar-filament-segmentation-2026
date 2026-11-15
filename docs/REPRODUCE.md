@@ -10,8 +10,10 @@ Final file: `release/submission_final.csv` (OOF PQ 0.4777). Inference only: `not
 | OS | Ubuntu 22.04 on WSL2 |
 | Python | 3.10.12 |
 | PyTorch | 2.9.1 (CUDA 12.8) |
-| detectron2 | 0.6 |
+| detectron2 | 0.6, `facebookresearch/detectron2` at commit `a2f4a87` |
 | Mask DINO | `IDEA-Research/MaskDINO` at commit `3831d85` |
+
+Install detectron2 with `pip install --no-build-isolation 'git+https://github.com/facebookresearch/detectron2.git@a2f4a87'`.
 
 Our changes to Mask DINO are in `patches/maskdino_filament.patch`. One new file, `patches/point_mask.py`, goes into `maskdino/modeling/`. Apply both before building the CUDA ops:
 

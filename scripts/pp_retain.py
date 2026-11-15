@@ -1,4 +1,4 @@
-"""Retain-fraction rule search (thr x area x keep), nested 5-fold CV on OOF-707. Usage: python3 scripts/pp_retain.py <workers> <out.npz>
+"""Retain-fraction rule search (thr x area x keep), nested 5-fold CV on OOF-707. Usage: python3 scripts/pp_retain.py <workers> <out.npz>"""
 import itertools, json, multiprocessing as mp, sys, time
 from pathlib import Path
 import numpy as np
