@@ -26,6 +26,10 @@ termcolor==3.3.0
 timm==1.0.29
 Cython==3.3.0
 markdown==3.10.3
+# Running the notebook (notebooks/pipeline_from_weights.ipynb)
+ipykernel==7.3.0
+nbclient==0.11.0
+nbconvert==7.17.1
 
 # Only for exploratory scripts that are not part of the final pipeline
 # (RF-DETR, SAM probes, semantic-segmentation baseline, Japanese plot labels):
