@@ -13,7 +13,7 @@ Final file: `release/submission_final.csv` (OOF PQ 0.4777). Inference only: `not
 | detectron2 | 0.6, `facebookresearch/detectron2` at commit `a2f4a87` |
 | Mask DINO | `IDEA-Research/MaskDINO` at commit `3831d85` |
 
-Install detectron2 with `pip install --no-build-isolation 'git+https://github.com/facebookresearch/detectron2.git@a2f4a87'`.
+Install detectron2 with `pip install --no-build-isolation 'git+https://github.com/facebookresearch/detectron2.git@a2f4a8771ab77e8411c26b27f24f9489a28a2453'`.
 
 Our changes to Mask DINO are in `patches/maskdino_filament.patch`. One new file, `patches/point_mask.py`, goes into `maskdino/modeling/`. Apply both before building the CUDA ops:
 
